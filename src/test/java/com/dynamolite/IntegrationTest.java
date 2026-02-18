@@ -2,7 +2,6 @@ package com.dynamolite;
 
 import org.junit.After;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Test;
 
 import java.util.concurrent.ExecutorService;
@@ -13,7 +12,6 @@ import static org.junit.Assert.*;
 /**
  * Integration tests for connectivity, replication, and failure recovery.
  */
-@Ignore("Disabled for now - debugging multi-node communication")
 public class IntegrationTest {
     private static final String HOST = "localhost";
     private Node node1;
@@ -39,7 +37,7 @@ public class IntegrationTest {
         Thread.sleep(1000); // Wait for ports to be released
     }
 
-    @Test
+    @Test(timeout = 15000)
     public void testHeartbeatResponse() {
         try {
             node1 = startNode(5001);
@@ -53,7 +51,7 @@ public class IntegrationTest {
         }
     }
 
-    @Test
+    @Test(timeout = 20000)
     public void testBasicReplication() {
         try {
             node1 = startNode(5001);
@@ -83,7 +81,7 @@ public class IntegrationTest {
         }
     }
 
-    @Test
+    @Test(timeout = 30000)
     public void testNodeFailureRecovery() {
         try {
             node1 = startNode(5001);
