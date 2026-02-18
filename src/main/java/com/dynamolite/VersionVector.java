@@ -1,6 +1,9 @@
 package com.dynamolite;
 
+import java.io.Serializable;
 import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.Objects;
 
@@ -8,7 +11,8 @@ import java.util.Objects;
  * VersionVector implements a vector clock for tracking data versions across nodes.
  * It helps in detecting concurrent modifications and resolving conflicts.
  */
-public class VersionVector {
+public class VersionVector implements Serializable {
+    private static final long serialVersionUID = 1L;
     private final Map<String, Long> vector;
     private final String nodeId;
 
@@ -42,7 +46,11 @@ public class VersionVector {
         boolean thisGreater = false;
         boolean otherGreater = false;
 
-        for (String node : vector.keySet()) {
+        // Check all nodes from both vectors
+        Set<String> allNodes = new HashSet<>(vector.keySet());
+        allNodes.addAll(other.vector.keySet());
+
+        for (String node : allNodes) {
             long thisVersion = vector.getOrDefault(node, 0L);
             long otherVersion = other.vector.getOrDefault(node, 0L);
 
@@ -75,4 +83,4 @@ public class VersionVector {
     public String toString() {
         return vector.toString();
     }
-} 
+}

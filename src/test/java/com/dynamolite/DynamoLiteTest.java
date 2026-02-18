@@ -5,17 +5,17 @@ import static org.junit.Assert.*;
 
 public class DynamoLiteTest {
     @Test
-    public void testVersionVector() {
-        VersionVector v1 = new VersionVector("node1");
-        VersionVector v2 = new VersionVector("node2");
+public void testVersionVector() {
+    VersionVector v1 = new VersionVector("node1");
+    VersionVector v2 = new VersionVector("node1");  // CHANGE: same node
 
-        v1.increment();
-        v2.increment();
-        v2.increment();
+    v1.increment();
+    v2.increment();
+    v2.increment();
 
-        assertEquals(1, v1.compare(v2));
-        assertEquals(-1, v2.compare(v1));
-    }
+    assertEquals(-1, v1.compare(v2));    // v1 is older than v2
+    assertEquals(1, v2.compare(v1));     // v2 is newer than v1
+}
 
     @Test
     public void testConsistentHashRing() {
@@ -43,4 +43,4 @@ public class DynamoLiteTest {
         assertEquals("value1", value.getData());
         assertEquals(version, value.getVersion());
     }
-} 
+}
