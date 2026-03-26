@@ -9,11 +9,12 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Node represents a single server in the distributed system.
- * It handles client requests and coordinates with other nodes.
+ * Handles client requests and coordinates quorum reads/writes with peer nodes.
  */
 public class Node {
     private static final Logger logger = LoggerFactory.getLogger(Node.class);
     private static boolean HEALTH_CHECK_ENABLED = true;
+
     private final String nodeId;
     private final int port;
     private final Storage storage;
@@ -51,6 +52,13 @@ public class Node {
 
     public static void setHealthCheckEnabled(boolean enabled) {
         HEALTH_CHECK_ENABLED = enabled;
+    }
+
+    /**
+     * Enable or disable storage persistence (useful for performance testing).
+     */
+    public void setPersistenceEnabled(boolean enabled) {
+        storage.setPersistenceEnabled(enabled);
     }
 
     public String getNodeId() {
@@ -93,63 +101,100 @@ public class Node {
     }
 
     private void handleClient(Socket clientSocket) {
-        try (ObjectInputStream in = new ObjectInputStream(clientSocket.getInputStream());
-             ObjectOutputStream out = new ObjectOutputStream(clientSocket.getOutputStream())) {
+        try {
+            // IMPORTANT: ObjectOutputStream must be created and flushed BEFORE
+            // ObjectInputStream to avoid a deadlock when both sides open streams
+            // simultaneously. This order must match Client.java and NodeConnection.java.
+            ObjectOutputStream out = new ObjectOutputStream(clientSocket.getOutputStream());
+            out.flush();
+            ObjectInputStream in = new ObjectInputStream(clientSocket.getInputStream());
 
-            Request request = (Request) in.readObject();
-            Response response = processRequest(request);
-            out.writeObject(response);
-        } catch (IOException | ClassNotFoundException e) {
-            logger.error("Error handling client request: {}", e.getMessage());
+            while (true) {
+                try {
+                    Request request = (Request) in.readObject();
+                    Response response = processRequest(request);
+                    out.writeObject(response);
+                    out.flush();
+                } catch (EOFException | SocketException e) {
+                    // Client closed the connection — this is normal
+                    break;
+                } catch (IOException | ClassNotFoundException e) {
+                    logger.debug("Error processing request: {}", e.getMessage());
+                    break;
+                }
+            }
+        } catch (IOException e) {
+            logger.error("Error setting up client connection: {}", e.getMessage());
+        } finally {
+            try {
+                if (clientSocket != null && !clientSocket.isClosed()) {
+                    clientSocket.close();
+                }
+            } catch (IOException e) {
+                // Ignore
+            }
         }
     }
 
     private Response processRequest(Request request) {
         switch (request.getType()) {
-            case PUT:
-                return handlePut(request);
-            case GET:
-                return handleGet(request);
-            case DELETE:
-                return handleDelete(request);
-            case HEARTBEAT:
-                return new Response(Response.Status.SUCCESS, "PONG");
-            default:
-                return new Response(Response.Status.ERROR, "Unknown request type");
+            case PUT:       return handlePut(request);
+            case GET:       return handleGet(request);
+            case DELETE:    return handleDelete(request);
+            case HEARTBEAT: return new Response(Response.Status.SUCCESS, "PONG");
+            default:        return new Response(Response.Status.ERROR, "Unknown request type");
         }
     }
 
     private Response handlePut(Request request) {
         String key = request.getKey();
         List<String> nodes = hashRing.getNodes(key, writeQuorum);
-        
-        if (!nodes.contains(nodeId)) {
-            return new Response(Response.Status.ERROR, "Not responsible for this key");
+
+        // Replica write: another node is coordinating — just store locally
+        if (request.getVersion() != null) {
+            storage.put(key, request.getValue(), request.getVersion());
+            return new Response(Response.Status.SUCCESS, "Replica stored");
         }
 
+        // Coordinator write: replicate to all nodes in the preference list
         VersionVector version = new VersionVector(nodeId);
         version.increment();
-        storage.put(key, request.getValue(), version);
 
-        // Replicate to other nodes
+        int successCount = 0;
         for (String node : nodes) {
-            if (!node.equals(nodeId)) {
-                replicatePut(node, key, request.getValue(), version);
+            if (node.equals(nodeId)) {
+                storage.put(key, request.getValue(), version);
+                successCount++;
+            } else {
+                try {
+                    NodeConnection connection = getConnection(node);
+                    if (connection != null) {
+                        Response r = connection.sendRequest(
+                            new Request(Request.Type.PUT, key, request.getValue(), version));
+                        if (r.isSuccess()) {
+                            successCount++;
+                        }
+                    }
+                } catch (IOException e) {
+                    // Evict the stale connection so next call re-establishes it
+                    connections.remove(node);
+                    logger.debug("Failed to replicate PUT to node {}: {}", node, e.getMessage());
+                }
             }
         }
 
-        return new Response(Response.Status.SUCCESS, "Value stored");
+        if (successCount >= writeQuorum) {
+            return new Response(Response.Status.SUCCESS, "Value stored");
+        } else {
+            return new Response(Response.Status.ERROR, "Failed to achieve write quorum");
+        }
     }
 
     private Response handleGet(Request request) {
         String key = request.getKey();
         List<String> nodes = hashRing.getNodes(key, readQuorum);
 
-        if (!nodes.contains(nodeId)) {
-            return new Response(Response.Status.ERROR, "Not responsible for this key");
-        }
-
-        // Replica read: another node is doing quorum read; return only local value
+        // Replica read: coordinator is collecting quorum — return local value only
         if (request.isReplicaRead()) {
             Storage.Value local = storage.get(key);
             if (local == null) {
@@ -158,7 +203,7 @@ public class Node {
             return new Response(Response.Status.SUCCESS, local.getData());
         }
 
-        // Quorum read: collect responses from all nodes in the read quorum
+        // Coordinator read: collect responses from all nodes in the read quorum
         List<Storage.Value> valuesWithVersion = new ArrayList<>();
         for (String node : nodes) {
             if (node.equals(nodeId)) {
@@ -170,12 +215,15 @@ public class Node {
                 try {
                     NodeConnection connection = getConnection(node);
                     if (connection != null) {
-                        Response r = connection.sendRequest(new Request(Request.Type.GET, key, null, null, true));
+                        Response r = connection.sendRequest(
+                            new Request(Request.Type.GET, key, null, null, true));
                         if (r.isSuccess() && r.getMessage() != null) {
                             valuesWithVersion.add(new Storage.Value(r.getMessage(), null));
                         }
                     }
                 } catch (IOException e) {
+                    // Evict the stale connection so next call re-establishes it
+                    connections.remove(node);
                     logger.debug("Quorum read: failed to get from node {}: {}", node, e.getMessage());
                 }
             }
@@ -185,7 +233,7 @@ public class Node {
             return new Response(Response.Status.NOT_FOUND, "Key not found");
         }
 
-        // Pick latest by version (prefer entries with non-null version; then compare)
+        // Pick the most recent value by version vector comparison
         Storage.Value best = valuesWithVersion.get(0);
         for (int i = 1; i < valuesWithVersion.size(); i++) {
             Storage.Value candidate = valuesWithVersion.get(i);
@@ -203,47 +251,40 @@ public class Node {
     private Response handleDelete(Request request) {
         String key = request.getKey();
         List<String> nodes = hashRing.getNodes(key, writeQuorum);
-        
-        if (!nodes.contains(nodeId)) {
-            return new Response(Response.Status.ERROR, "Not responsible for this key");
-        }
 
-        storage.remove(key);
-
-        // Replicate delete to other nodes
+        int successCount = 0;
         for (String node : nodes) {
-            if (!node.equals(nodeId)) {
-                replicateDelete(node, key);
+            if (node.equals(nodeId)) {
+                storage.remove(key);
+                successCount++;
+            } else {
+                try {
+                    NodeConnection connection = getConnection(node);
+                    if (connection != null) {
+                        Response r = connection.sendRequest(
+                            new Request(Request.Type.DELETE, key, null, null));
+                        if (r.isSuccess()) {
+                            successCount++;
+                        }
+                    }
+                } catch (IOException e) {
+                    // Evict the stale connection so next call re-establishes it
+                    connections.remove(node);
+                    logger.debug("Failed to replicate DELETE to node {}: {}", node, e.getMessage());
+                }
             }
         }
 
-        return new Response(Response.Status.SUCCESS, "Value deleted");
-    }
-
-    private void replicatePut(String nodeId, String key, String value, VersionVector version) {
-        try {
-            NodeConnection connection = getConnection(nodeId);
-            if (connection != null) {
-                connection.sendRequest(new Request(Request.Type.PUT, key, value, version));
-            }
-        } catch (IOException e) {
-            logger.error("Error replicating PUT to node {}: {}", nodeId, e.getMessage());
-        }
-    }
-
-    private void replicateDelete(String nodeId, String key) {
-        try {
-            NodeConnection connection = getConnection(nodeId);
-            if (connection != null) {
-                connection.sendRequest(new Request(Request.Type.DELETE, key, null, null));
-            }
-        } catch (IOException e) {
-            logger.error("Error replicating DELETE to node {}: {}", nodeId, e.getMessage());
+        if (successCount >= writeQuorum) {
+            return new Response(Response.Status.SUCCESS, "Value deleted");
+        } else {
+            return new Response(Response.Status.ERROR, "Failed to achieve write quorum");
         }
     }
 
     /**
-     * Returns the connection to the given node, or null if the connection could not be established.
+     * Returns an active connection to the given peer node, creating one if needed.
+     * Returns null if the connection cannot be established.
      */
     public NodeConnection getConnection(String nodeId) {
         return connections.computeIfAbsent(nodeId, id -> {
@@ -262,10 +303,9 @@ public class Node {
             System.out.println("Usage: java Node <port>");
             return;
         }
-
         int port = Integer.parseInt(args[0]);
         String dataDir = "data/node_" + port;
-        Node node = new Node(port, dataDir, 2, 2); // Example quorum sizes
+        Node node = new Node(port, dataDir, 2, 2);
         node.start();
     }
-} 
+}

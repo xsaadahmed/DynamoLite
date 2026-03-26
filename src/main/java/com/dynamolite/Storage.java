@@ -14,12 +14,20 @@ public class Storage {
     private final Map<String, Value> data;
     private final String dataDir;
     private static final String DATA_FILE = "storage.dat";
+    private boolean persistenceEnabled = true;
 
     public Storage(String dataDir) {
         this.dataDir = dataDir;
         this.data = new ConcurrentHashMap<>();
         createDataDirectory();
         loadData();
+    }
+    
+    /**
+     * Enable or disable disk persistence (useful for testing)
+     */
+    public void setPersistenceEnabled(boolean enabled) {
+        this.persistenceEnabled = enabled;
     }
 
     private void createDataDirectory() {
@@ -71,9 +79,12 @@ public class Storage {
     }
 
     /**
-     * Saves data to disk
+     * Saves data to disk (only if persistence is enabled)
      */
     private void saveData() {
+        if (!persistenceEnabled) {
+            return; // Skip disk I/O during tests
+        }
         File file = new File(dataDir, DATA_FILE);
         try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(file))) {
             oos.writeObject(data);
@@ -103,4 +114,4 @@ public class Storage {
             return version;
         }
     }
-} 
+}
